@@ -48,8 +48,17 @@ typedef struct
 	Latch	   *bgwriterLatch;
 } BufferStrategyControl;
 
+typedef struct StackNode
+{
+	StackNode  *next;
+	StackNode  *prev;
+	int			buf_id;
+} 	StackNode;
+
 /* Pointers to shared state */
 static BufferStrategyControl *StrategyControl = NULL;
+static StackNode stackTop = NULL;
+static StackNode stackBottom = NULL;
 
 /*
  * Private (non-shared) state for managing a ring of shared buffers to re-use.
@@ -83,7 +92,6 @@ typedef struct BufferAccessStrategyData
 	 */
 	Buffer		buffers[1];		/* VARIABLE SIZE ARRAY */
 }	BufferAccessStrategyData;
-
 
 /* Prototypes for internal functions */
 static volatile BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy);
@@ -192,6 +200,10 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		{
 			if (strategy != NULL)
 				AddBufferToRing(strategy, buf);
+		
+			//cs3223
+			StrategyUpdateAccessedBuffer(buf->buf_id, false);
+		
 			return buf;
 		}
 		UnlockBufHdr(buf);
@@ -226,6 +238,10 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 				/* Found a usable buffer */
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
+	
+				//cs3223
+				StrategyUpdateAccessedBuffer(buf->buf_id, false);
+
 				return buf;
 			}
 		}
@@ -264,6 +280,9 @@ StrategyFreeBuffer(volatile BufferDesc *buf)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
 	}
+
+	// cs3223 
+	StrategyUpdateAccessedBuffer(buf->buf_id, true);
 
 	LWLockRelease(BufFreelistLock);
 }
