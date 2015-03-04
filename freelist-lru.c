@@ -18,6 +18,16 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 
+#include "stdio.h"
+
+
+typedef struct StackNode StackNode;
+struct StackNode
+{
+	StackNode  *next;
+	StackNode  *prev;
+	int			buf_id;
+};
 
 /*
  * The shared freelist control information.
@@ -45,20 +55,14 @@ typedef struct
 	/*
 	 * Notification latch, or NULL if none.  See StrategyNotifyBgWriter.
 	 */
+
+	StackNode  *stackTop;
+
 	Latch	   *bgwriterLatch;
 } BufferStrategyControl;
 
-typedef struct StackNode
-{
-	StackNode  *next;
-	StackNode  *prev;
-	int			buf_id;
-} 	StackNode;
-
 /* Pointers to shared state */
 static BufferStrategyControl *StrategyControl = NULL;
-static StackNode stackTop = NULL;
-static StackNode stackBottom = NULL;
 
 /*
  * Private (non-shared) state for managing a ring of shared buffers to re-use.
@@ -106,7 +110,40 @@ static void AddBufferToRing(BufferAccessStrategy strategy,
 void
 StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 {
-	elog(ERROR, "StrategyUpdateAccessedBuffer: Not implemented!");
+	StackNode *current;
+
+	current = StrategyControl->stackTop->next;
+	printf("Update %d\n",buf_id);
+	while (current != NULL) printf("%d ", current->buf_id), current = current->next;putchar('\n');
+
+	current = StrategyControl->stackTop->next;
+	while (current != NULL)
+	{
+		if (current->buf_id) {
+			if (current->prev != NULL)
+				current->prev->next = current->next;
+			if (current->next != NULL)
+				current->next->prev = current->prev;
+			break;
+		}
+		current = current -> next;
+	}
+	if (delete) 
+		return;
+	if (current == NULL) {
+		current = (StackNode*) palloc0(sizeof(StackNode));
+	}
+	current->buf_id = buf_id;
+	if (StrategyControl->stackTop->next != NULL) {
+		StrategyControl->stackTop->next->prev = current;
+	}
+	current->next = StrategyControl->stackTop->next;
+
+	current->prev = StrategyControl->stackTop;
+	StrategyControl->stackTop->next = current;
+
+	current = StrategyControl->stackTop->next;
+	while (current != NULL) printf("%d ", current->buf_id), current = current->next;putchar('\n');
 }
 
 /*
@@ -131,7 +168,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 {
 	volatile BufferDesc *buf;
 	Latch	   *bgwriterLatch;
-	int			trycounter;
+	StackNode  *current;
+	int 		trycounter;
 
 	/*
 	 * If given a strategy object, see whether it can select a buffer. We
@@ -183,11 +221,13 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 	{
 		buf = &BufferDescriptors[StrategyControl->firstFreeBuffer];
 		Assert(buf->freeNext != FREENEXT_NOT_IN_LIST);
+		printf("Test with %d %d\n", StrategyControl->firstFreeBuffer, buf->buf_id);
 
 		/* Unconditionally remove buffer from freelist */
 		StrategyControl->firstFreeBuffer = buf->freeNext;
 		buf->freeNext = FREENEXT_NOT_IN_LIST;
 
+ 
 		/*
 		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
 		 * it; discard it and retry.  (This can only happen if VACUUM put a
@@ -200,65 +240,48 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		{
 			if (strategy != NULL)
 				AddBufferToRing(strategy, buf);
-		
-			//cs3223
+			current = StrategyControl->stackTop->next;
+			while (current != NULL) printf("%d ", current->buf_id), current = current->next;putchar('\n');
+			printf("Add new %d\n", buf->buf_id);
+
 			StrategyUpdateAccessedBuffer(buf->buf_id, false);
-		
 			return buf;
 		}
 		UnlockBufHdr(buf);
 	}
 
-	/* Nothing on the freelist, so run the "clock sweep" algorithm */
-	trycounter = NBuffers;
-	for (;;)
+	if (StrategyControl->stackTop != NULL)
 	{
-		buf = &BufferDescriptors[StrategyControl->nextVictimBuffer];
-
-		if (++StrategyControl->nextVictimBuffer >= NBuffers)
+		current = StrategyControl->stackTop->next;
+		while (1) 
 		{
-			StrategyControl->nextVictimBuffer = 0;
-			StrategyControl->completePasses++;
-		}
-
-		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
-		 */
-		LockBufHdr(buf);
-		if (buf->refcount == 0)
-		{
-			if (buf->usage_count > 0)
+			printf("current is %d\n", current->buf_id);
+			buf = &BufferDescriptors[current->buf_id];
+			LockBufHdr(buf);
+			if (buf->refcount == 0)
 			{
-				buf->usage_count--;
-				trycounter = NBuffers;
-			}
-			else
-			{
+				if (buf->usage_count > 0)
+					buf->usage_count--;
 				/* Found a usable buffer */
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
-	
-				//cs3223
 				StrategyUpdateAccessedBuffer(buf->buf_id, false);
-
+				UnlockBufHdr(buf);
+				printf("\n");
 				return buf;
+			} 
+			else if (current->next == NULL)
+			{
+				UnlockBufHdr(buf);
+				elog(ERROR, "no unpinned buffers available");
 			}
+			current = current->next;
 		}
-		else if (--trycounter == 0)
-		{
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf);
-			elog(ERROR, "no unpinned buffers available");
-		}
-		UnlockBufHdr(buf);
-	}
+	} 
+	else 
+		elog(ERROR, "no unpinned buffers available");
+
+
 }
 
 /*
@@ -279,11 +302,10 @@ StrategyFreeBuffer(volatile BufferDesc *buf)
 		if (buf->freeNext < 0)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
+		StrategyUpdateAccessedBuffer(buf->buf_id, true);
 	}
 
 	// cs3223 
-	StrategyUpdateAccessedBuffer(buf->buf_id, true);
-
 	LWLockRelease(BufFreelistLock);
 }
 
@@ -357,6 +379,9 @@ StrategyShmemSize(void)
 	/* size of the shared replacement strategy control block */
 	size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
+	/* size of the shared replacement strategy control block */
+	size = add_size(size, MAXALIGN(sizeof(StackNode) * NBuffers));
+
 	return size;
 }
 
@@ -415,6 +440,9 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwriterLatch = NULL;
+
+		StrategyControl->stackTop = ShmemInitStruct("StackNode", sizeof(StackNode), &found);
+		StrategyControl->stackTop->next = NULL;
 	}
 	else
 		Assert(!init);
