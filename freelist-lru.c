@@ -27,6 +27,7 @@ struct StackNode
 	StackNode  *next;
 	StackNode  *prev;
 	int			buf_id;
+	bool 		is_free;
 };
 
 /*
@@ -56,9 +57,11 @@ typedef struct
 	 * Notification latch, or NULL if none.  See StrategyNotifyBgWriter.
 	 */
 
-	StackNode  *stackTop;
+	StackNode	stackTop;
 
 	Latch	   *bgwriterLatch;
+
+	StackNode	stack[1];
 } BufferStrategyControl;
 
 /* Pointers to shared state */
@@ -112,53 +115,47 @@ StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 {
 	StackNode *current;
 	StackNode *bottom;
+	int i;
 
-	printf("%d\n",buf_id);
-	// printf("Update %d\n",buf_id);
-	// current = StrategyControl->stackTop->next;
-	// printf("Stage 1: ");while (current != NULL) printf("%d ", current->buf_id), current = current->next;putchar('\n');
-
-	current = StrategyControl->stackTop->next;
+	current = StrategyControl->stackTop.next;
 	while (current != NULL)
 	{
-		if (current->buf_id == buf_id) {
-			if (current->prev != NULL) {
+		if (current->buf_id == buf_id) 
+		{
+			if (current->prev != NULL) 
 				current->prev->next = current->next;
-			}
-			if (current->next != NULL) {
+			if (current->next != NULL) 
 				current->next->prev = current->prev;
-			}
 			break;
 		}
 		current = current->next;
 	}
-	if (delete) {
-		printf("Deleting\n");
+	if (delete) 
+	{
 		if (current != NULL)
-			pfree(current);
+			current->is_free = true;
+		return;
 	}
-	if (current == NULL) {
-		current = (StackNode*) palloc0(sizeof(StackNode));
-	}
+	if (current == NULL) 
+		for (i = 0; i < NBuffers; ++i) 
+			if (StrategyControl->stack[i].is_free) 
+			{
+				StrategyControl->stack[i].is_free = false;
+				current = &StrategyControl->stack[i];
+				break;
+			}
+	if (current == NULL)
+		elog(ERROR, "all nodes are allocated");
 
-	bottom = StrategyControl->stackTop;
-	while (bottom->next != NULL) {
+	bottom = &StrategyControl->stackTop;
+	while (bottom->next != NULL) 
 		bottom = bottom->next;
-	}
 
 	current->buf_id = buf_id;
 	bottom->next = current;
 	current->prev = bottom;
 	current->next = NULL;
 
-	// current->next = StrategyControl->stackTop->next;
-
-	// current->prev = StrategyControl->stackTop;
-	// StrategyControl->stackTop->next = current;
-
-	// current = StrategyControl->stackTop->next;
-	// printf("Top: %d\n", (StrategyControl->stackTop == StrategyControl->stackTop->next->prev));
-	// printf("Stage 3: ");while (current != NULL) printf("%d ", current->buf_id), current = current->next;putchar('\n');
 }
 
 /*
@@ -184,8 +181,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 	volatile BufferDesc *buf;
 	Latch	   *bgwriterLatch;
 	StackNode  *current;
-	StackNode  *current2;
-	int 		trycounter;
 
 	/*
 	 * If given a strategy object, see whether it can select a buffer. We
@@ -255,49 +250,37 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 			if (strategy != NULL)
 				AddBufferToRing(strategy, buf);
 
-
 			StrategyUpdateAccessedBuffer(buf->buf_id, false);
 			return buf;
 		}
 		UnlockBufHdr(buf);
 	}
 
-	if (StrategyControl->stackTop != NULL)
+	current = &StrategyControl->stackTop;
+	while (1) 
 	{
-		current2 = StrategyControl->stackTop->next;
-		printf("Case 3: ");while (current2 != NULL) printf("%d ", current2->buf_id), current2 = current2->next;putchar('\n');
-		current = StrategyControl->stackTop;
-		trycounter = 0;
-		while (1) 
+		if (current->next != NULL) 
 		{
-			if (current->next != NULL) 
+			current = current->next;
+			buf = &BufferDescriptors[current->buf_id];
+			LockBufHdr(buf);
+			if (buf->refcount == 0)
 			{
-				current = current->next;
-				++trycounter;
-				buf = &BufferDescriptors[current->buf_id];
-				LockBufHdr(buf);
-				if (buf->refcount == 0)
-				{
-					if (buf->usage_count > 0)
-						buf->usage_count--;
-					/* Found a usable buffer */
-					if (strategy != NULL)
-						AddBufferToRing(strategy, buf);
-					StrategyUpdateAccessedBuffer(buf->buf_id, false);
-					UnlockBufHdr(buf);
-					return buf;
-				} 
-			} 
-			else 
-			{
-				printf("Counter: %d\n", trycounter);
+				if (buf->usage_count > 0)
+					buf->usage_count--;
+				/* Found a usable buffer */
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				StrategyUpdateAccessedBuffer(buf->buf_id, false);
 				UnlockBufHdr(buf);
-				elog(ERROR, "no unpinned buffers available");
-			}
+				return buf;
+			} 
+			UnlockBufHdr(buf);
+		} 
+		else 
+		{
+			elog(ERROR, "no unpinned buffers available");
 		}
-	} 
-	else {
-		elog(ERROR, "this is impossible");
 	}
 
 
@@ -415,6 +398,7 @@ void
 StrategyInitialize(bool init)
 {
 	bool		found;
+	int 		i;
 
 	/*
 	 * Initialize the shared buffer lookup hashtable.
@@ -433,7 +417,7 @@ StrategyInitialize(bool init)
 	 */
 	StrategyControl = (BufferStrategyControl *)
 		ShmemInitStruct("Buffer Strategy Status",
-						sizeof(BufferStrategyControl),
+						offsetof(BufferStrategyControl, stack) + NBuffers * sizeof(StackNode),
 						&found);
 
 	if (!found)
@@ -459,9 +443,17 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwriterLatch = NULL;
+		
+		StrategyControl->stackTop.next = NULL;
+		StrategyControl->stackTop.next = NULL;
+		StrategyControl->stackTop.prev = NULL;
 
-		StrategyControl->stackTop = (StackNode*) palloc0(sizeof(StackNode));
-		StrategyControl->stackTop->next = NULL;
+		for (i = 0; i < NBuffers; ++i) {
+			StrategyControl->stack[i].next = NULL;
+			StrategyControl->stack[i].prev = NULL;
+			StrategyControl->stack[i].is_free = true;
+
+		}
 	}
 	else
 		Assert(!init);

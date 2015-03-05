@@ -3,6 +3,7 @@
 DBNAME=assign1
 
 # check that server is running
+echo "Running Stage 1"
 status=$(pg_ctl status)
 if [ $? -ne 0 ]; then
 	echo "ERROR: postgres server is not running!"
@@ -10,6 +11,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # check that number of shared buffer pages is configured to 16 pages
+echo "Running Stage 2"
 status=$(psql -c "SHOW shared_buffers;" $DBNAME | grep "128kB")
 if [ $? -ne 0 ]; then
 	echo "ERROR: restart server with 16 buffer pages!"
@@ -19,6 +21,7 @@ fi
 cd ~/assign1
 
 # load data into movies relation if necessary
+echo "Running Stage 3"
 status=$(psql -c "SELECT COUNT(*) FROM movies;" $DBNAME | grep "1681")
 if [ $? -ne 0 ]; then
 	psql -f ~/assign1/testdata/load-data.sql $DBNAME
